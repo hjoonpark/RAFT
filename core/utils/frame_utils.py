@@ -3,7 +3,7 @@ from PIL import Image
 from os.path import *
 import re
 
-import cv2
+import cv2, os
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
@@ -98,12 +98,13 @@ def writeFlow(filename,uv,v=None):
     tmp.astype(np.float32).tofile(f)
     f.close()
 
-
 def readFlowKITTI(filename):
-    flow = cv2.imread(filename, cv2.IMREAD_ANYDEPTH|cv2.IMREAD_COLOR)
+    exi = os.path.exists(filename)
+    # flow = cv2.imread(filename, cv2.IMREAD_ANYDEPTH|cv2.IMREAD_COLOR)
+    flow = np.load(filename).astype(np.float32)
     flow = flow[:,:,::-1].astype(np.float32)
     flow, valid = flow[:, :, :2], flow[:, :, 2]
-    flow = (flow - 2**15) / 64.0
+    # flow = (flow - 2**15) / 64.0
     return flow, valid
 
 def readDispKITTI(filename):
@@ -134,4 +135,7 @@ def read_gen(file_name, pil=False):
             return flow
         else:
             return flow[:, :, :-1]
+    elif ext == ".npy":
+        flow = np.load(file_name).astype(np.float32)
+        return flow
     return []

@@ -68,62 +68,6 @@ def flow_warp(x, flow, pad='border', mode='bilinear'):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def fetch_optimizer(args, model):
-    """ Create the optimizer and learning rate scheduler """
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=args.epsilon)
-
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
-        pct_start=0.05, cycle_momentum=False, anneal_strategy='linear')
-
-    return optimizer, scheduler
-    
-
-class Logger:
-    def __init__(self, model, scheduler):
-        self.model = model
-        self.scheduler = scheduler
-        self.total_steps = 0
-        self.running_loss = {}
-        self.writer = None
-
-    def _print_training_status(self):
-        metrics_data = [self.running_loss[k]/SUM_FREQ for k in sorted(self.running_loss.keys())]
-        training_str = "[{:6d}, {:10.7f}] ".format(self.total_steps+1, self.scheduler.get_last_lr()[0])
-        metrics_str = ("{:10.4f}, "*len(metrics_data)).format(*metrics_data)
-        
-        # print the training status
-        print(training_str + metrics_str)
-
-        if self.writer is None:
-            self.writer = SummaryWriter()
-
-        for k in self.running_loss:
-            self.writer.add_scalar(k, self.running_loss[k]/SUM_FREQ, self.total_steps)
-            self.running_loss[k] = 0.0
-
-    def push(self, metrics):
-        self.total_steps += 1
-
-        for key in metrics:
-            if key not in self.running_loss:
-                self.running_loss[key] = 0.0
-
-            self.running_loss[key] += metrics[key]
-
-        if self.total_steps % SUM_FREQ == SUM_FREQ-1:
-            self._print_training_status()
-            self.running_loss = {}
-
-    def write_dict(self, results):
-        if self.writer is None:
-            self.writer = SummaryWriter()
-
-        for key in results:
-            self.writer.add_scalar(key, results[key], self.total_steps)
-
-    def close(self):
-        self.writer.close()
-
 
 def train(args):
 
@@ -133,39 +77,32 @@ def train(args):
     if args.restore_ckpt is not None:
         model.load_state_dict(torch.load(args.restore_ckpt), strict=False)
         print("Loaded model: {}".format(args.restore_ckpt))
+    else:
+        assert False
 
     model.cuda()
-    model.train()
+    model.eval()
 
     if args.stage != 'chairs':
         model.module.freeze_bn()
 
+    args.batch_size = 1
     train_loader = datasets.fetch_dataloader(args)
-    optimizer, scheduler = fetch_optimizer(args, model)
 
     total_steps = 0
-    scaler = GradScaler(enabled=args.mixed_precision)
-    logger = Logger(model, scheduler)
 
-    VAL_FREQ = 1000
+    VAL_FREQ = 5000
     add_noise = False
 
-    plot_dir = f"logs/{args.stage}/plots"
+    plot_dir = f"logs/{args.stage}/test"
     os.makedirs(plot_dir, exist_ok=1)
 
     w_smooth_reg = 0.01
-    should_keep_training = True
+    should_keep_training = False
     losses_all = {}
-    while should_keep_training:
+    with torch.no_grad():
         for i_batch, data_blob in enumerate(train_loader):
-            optimizer.zero_grad()
             image1, image2, flow_true, _ = [x.cuda() for x in data_blob]
-
-            if args.add_noise:
-                stdv = np.random.uniform(0.0, 5.0)
-                image1 = (image1 + stdv * torch.randn(*image1.shape).cuda()).clamp(0.0, 255.0)
-                image2 = (image2 + stdv * torch.randn(*image2.shape).cuda()).clamp(0.0, 255.0)
-
             flow_predictions = model(image1, image2, iters=args.iters)
 
             # warp frame 1 using flows
@@ -189,34 +126,14 @@ def train(args):
                             losses_all[k] = []
                         losses_all[k].append(l.item())
 
-            # loss, metrics = loss_fn.compute_losses(flow_predictions, flow, valid, args.gamma)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)                
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-            
-            scaler.step(optimizer)
-            scheduler.step()
-            scaler.update()
-
-            if total_steps % 1000 == 0:
-                plt.figure(figsize=(10,4))
-                for k, l in losses_all.items():
-                    plt.plot(np.arange(len(l)), l, label=k)
-                plt.legend()
-                plt.title("Iteration: {}".format(total_steps))
-                plt.tight_layout()
-                save_path = os.path.join(plot_dir, "losses.jpg")
-                plt.savefig(save_path, dpi=150)
-                print("[{}] {}".format(total_steps, save_path))
-                plt.close()
-
+            if True:
                 B = 0
                 R = 3
-                C = 3 + len(flow_predictions)
+                C = 2 + 1#len(flow_predictions)
                 I1 = image1[B].cpu().squeeze().permute(1,2,0).numpy()
                 I2 = image2[B].cpu().squeeze().permute(1,2,0).numpy()
 
-                fig = plt.figure(figsize=(60, 10))
+                fig = plt.figure(figsize=(3*C, 3*R))
                 ax = fig.add_subplot(R, C, 1)
                 ax.set_title("image 1 ({:.2f}, {:.2f})".format(I1.min(), I1.max()))
                 I1b = (I1-I1.min())/(I1.max()-I1.min())
@@ -234,6 +151,7 @@ def train(args):
                     ax.set_title("flow pred [{}]\n ({:.2f}, {:.2f})".format(i, f.min(), f.max()))
                     f = (f-f.min())/(f.max()-f.min())
                     ax.imshow(f)
+                    break
                 
                 for i in range(len(image2_preds)):
                     ax = fig.add_subplot(R, C, C + i + 3)
@@ -248,35 +166,25 @@ def train(args):
                     ax.set_title("error: ({:.2f}, {:.2f})".format(err.min(), err.max()))
                     err = (err-err.min())/(err.max()-err.min())
                     ax.imshow(err)
-
-                ax = fig.add_subplot(R, C, C)
-                f = flow_true[B].detach().cpu().squeeze().permute(1,2,0).numpy()
-                f = np.concatenate([f, np.zeros((f.shape[0], f.shape[1], 1))], -1)
-                ax.set_title("flow true\n({:.2f}, {:.2f})".format(f.min(), f.max()))
+                    break
+                
+                f = np.abs(I1-I2)
+                ax = fig.add_subplot(R, C, 2*C + 2)
+                ax.set_title("|image1 - image2|\n ({:.2f}, {:.2f})".format(f.min(), f.max()))
                 f = (f-f.min())/(f.max()-f.min())
                 ax.imshow(f)
+
+                # ax = fig.add_subplot(R, C, C)
+                # f = flow_true[B].detach().cpu().squeeze().permute(1,2,0).numpy()
+                # f = np.concatenate([f, np.zeros((f.shape[0], f.shape[1], 1))], -1)
+                # ax.set_title("flow true\n({:.2f}, {:.2f})".format(f.min(), f.max()))
+                # f = (f-f.min())/(f.max()-f.min())
+                # ax.imshow(f)
                 plt.tight_layout()
-                save_path = os.path.join(plot_dir, "plot_{:05d}.jpg".format(total_steps))
+                save_path = os.path.join(plot_dir, "plot_{:03d}.jpg".format(i_batch))
                 plt.savefig(save_path, dpi=150)
                 plt.close()
-                print("[{}] {}".format(total_steps, save_path))
-
-            if total_steps % VAL_FREQ == VAL_FREQ - 1:
-                PATH = 'checkpoints/%s.pth' % args.name
-                torch.save(model.state_dict(), PATH)
-
-            total_steps += 1
-
-            if total_steps > args.num_steps:
-                should_keep_training = False
-                break
-
-    logger.close()
-    PATH = 'checkpoints/%s.pth' % args.name
-    torch.save(model.state_dict(), PATH)
-
-    return PATH
-
+    print("DONE")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
